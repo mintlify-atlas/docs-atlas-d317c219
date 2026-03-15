@@ -1,0 +1,61 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Example Voting App",
+  "projectDescription": "A simple distributed voting application demonstrating multi-container Docker deployments across Compose, Swarm, and Kubernetes.",
+  "theme": "aspen",
+  "primaryColor": "#1c63ec",
+  "lightColor": "#8cb4f4",
+  "darkColor": "#04143c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Architecture",
+            "pages": ["architecture/overview", "architecture/services", "architecture/networking"]
+          },
+          {
+            "group": "Deployment",
+            "pages": ["deployment/docker-compose", "deployment/docker-swarm", "deployment/kubernetes"]
+          },
+          {
+            "group": "Services",
+            "pages": ["services/vote", "services/result", "services/worker", "services/redis", "services/postgres"]
+          },
+          {
+            "group": "Operations",
+            "pages": ["operations/healthchecks", "operations/scaling", "operations/customization"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-container distributed application using Docker Compose",
+    "Docker Swarm stack deployment with multiple replicas",
+    "Kubernetes deployment with full YAML specifications",
+    "Python Flask front-end voting interface",
+    "Node.js real-time results display via Socket.IO",
+    ".NET worker service consuming votes from Redis queue",
+    "Redis message queue for vote ingestion",
+    "PostgreSQL persistent storage for vote results",
+    "Health checks for all services",
+    "Configurable vote options via environment variables"
+  ],
+  "publicApiSurface": [
+    "vote service: GET/POST / (port 8080)",
+    "result service: GET / (port 8081)",
+    "OPTION_A environment variable (vote option, default: Cats)",
+    "OPTION_B environment variable (vote option, default: Dogs)",
+    "docker compose up",
+    "docker stack deploy --compose-file docker-stack.yml vote",
+    "kubectl create -f k8s-specifications/",
+    "kubectl delete -f k8s-specifications/",
+    "docker compose --profile seed up -d"
+  ]
+}
