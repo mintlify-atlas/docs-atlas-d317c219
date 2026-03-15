@@ -1,0 +1,156 @@
+---
+title: PostgreSQL Service
+description: Persistent relational database that stores the final processed vote for each voter.
+---
+
+PostgreSQL is the persistent data store for the voting app. The worker writes each processed vote here, and the result service reads from it every second to compute the current tallies.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Image" icon="box">
+    `postgres:15-alpine`
+  </Card>
+  <Card title="Exposed ports" icon="server">
+    None — `back-tier` network only
+  </Card>
+  <Card title="Persistent volume" icon="hard-drive">
+    `db-data` mounted at `/var/lib/postgresql/data`
+  </Card>
+  <Card title="Default database" icon="database">
+    `postgres`
+  </Card>
+</CardGroup>
+
+## Environment variables
+
+| Variable | Value | Description |
+|---|---|---|
+| `POSTGRES_USER` | `postgres` | Database superuser name |
+| `POSTGRES_PASSWORD` | `postgres` | Database superuser password |
+
+The default database created by the official image matches the value of `POSTGRES_USER`, so the database name is also `postgres`.
+
+## Schema
+
+The worker service creates the `votes` table on startup if it does not already exist:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+)
+```
+
+| Column | Type | Constraint | Description |
+|---|---|---|---|
+| `id` | `VARCHAR(255)` | `NOT NULL UNIQUE` | The `voter_id` cookie value from the browser |
+| `vote` | `VARCHAR(255)` | `NOT NULL` | The chosen option — `"a"` or `"b"` |
+
+The `UNIQUE` constraint on `id` enforces one vote per browser. When a voter changes their choice, the worker catches the duplicate-key error from `INSERT` and issues an `UPDATE` instead, replacing the previous vote.
+
+## Persistence
+
+Vote data survives container restarts and recreations through a named Docker volume:
+
+```yaml
+volumes:
+  - "db-data:/var/lib/postgresql/data"
+```
+
+The `db-data` volume is declared at the top level of the Compose file:
+
+```yaml
+volumes:
+  db-data:
+```
+
+<Note>
+  Removing the volume (`docker volume rm`) will permanently delete all stored votes. The schema will be recreated by the worker on next startup, but historical vote data cannot be recovered.
+</Note>
+
+## Health check
+
+The container mounts the local `./healthchecks` directory and uses a custom shell script:
+
+```yaml
+volumes:
+  - "db-data:/var/lib/postgresql/data"
+  - "./healthchecks:/healthchecks"
+healthcheck:
+  test: /healthchecks/postgres.sh
+  interval: "5s"
+```
+
+### healthchecks/postgres.sh
+
+```bash
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+	# force postgres to not use the local unix socket (test "external" connectibility)
+	--host "$host"
+	--username "$user"
+	--dbname "$db"
+	--quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+The script connects via TCP (using the container's IP address rather than a Unix socket) so that it tests the same network path that other services use. It runs `SELECT 1` and expects the result `1`; any failure exits with code `1`, marking the container as unhealthy.
+
+<Note>
+  Both the worker and the result service declare `depends_on: db: condition: service_healthy`. Docker Compose waits for this check to pass before starting those containers.
+</Note>
+
+## Connection strings
+
+The two services that connect to PostgreSQL use different client libraries and therefore different connection string formats:
+
+<AccordionGroup>
+  <Accordion title="Worker (Npgsql / C#)">
+    ```
+    Server=db;Username=postgres;Password=postgres;
+    ```
+
+    `db` is the Docker Compose service name for the PostgreSQL container. Npgsql resolves it via Docker's internal DNS.
+  </Accordion>
+  <Accordion title="Result service (node-postgres / Node.js)">
+    ```
+    postgres://postgres:postgres@db/postgres
+    ```
+
+    The URI format is `postgres://<user>:<password>@<host>/<database>`. Again, `db` resolves to the PostgreSQL container.
+  </Accordion>
+</AccordionGroup>
+
+## Docker Compose configuration
+
+```yaml
+db:
+  image: postgres:15-alpine
+  environment:
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "postgres"
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/postgres.sh
+    interval: "5s"
+  networks:
+    - back-tier
+```
+
+PostgreSQL is only connected to the `back-tier` network and has no host port mapping, so it is not directly reachable from outside the Compose project.

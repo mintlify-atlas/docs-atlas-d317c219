@@ -1,0 +1,273 @@
+---
+title: Customization
+description: Change vote options, seed test data, modify service code, and adjust credentials in the Example Voting App.
+---
+
+## Changing the Vote Options
+
+The vote service reads two environment variables to determine what choices to display. They default to `Cats` and `Dogs`.
+
+```python
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+```
+
+To use different options, add an `environment` section to the `vote` service in `docker-compose.yml`:
+
+<CodeGroup>
+
+```yaml Cats vs Dogs (default)
+services:
+  vote:
+    build:
+      context: ./vote
+      target: dev
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./vote:/usr/local/app
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier
+      - back-tier
+```
+
+```yaml Python vs JavaScript
+services:
+  vote:
+    build:
+      context: ./vote
+      target: dev
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./vote:/usr/local/app
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier
+      - back-tier
+    environment:
+      OPTION_A: "Python"
+      OPTION_B: "JavaScript"
+```
+
+```yaml Tabs vs Spaces
+services:
+  vote:
+    build:
+      context: ./vote
+      target: dev
+    environment:
+      OPTION_A: "Tabs"
+      OPTION_B: "Spaces"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier
+      - back-tier
+```
+
+</CodeGroup>
+
+After editing `docker-compose.yml`, restart just the vote service to apply the change:
+
+```bash
+docker compose up -d vote
+```
+
+<Note>
+  Changing `OPTION_A` or `OPTION_B` only affects the display labels. Votes are stored in PostgreSQL as the internal values `a` and `b`, so existing vote counts are preserved across option label changes.
+</Note>
+
+## Seeding Test Data
+
+The `seed` service is included in `docker-compose.yml` but is gated behind a [Compose profile](https://docs.docker.com/compose/profiles/) so it does not start on a normal `docker compose up`.
+
+```yaml
+# this service runs once to seed the database with votes
+# it won't run unless you specify the "seed" profile
+# docker compose --profile seed up -d
+seed:
+  build: ./seed-data
+  profiles: ["seed"]
+  depends_on:
+    vote:
+      condition: service_healthy
+  networks:
+    - front-tier
+  restart: "no"
+```
+
+To start the app and seed it in one command:
+
+```bash
+docker compose --profile seed up -d
+```
+
+Or, if the app is already running and the vote service is healthy, start only the seed container:
+
+```bash
+docker compose --profile seed up seed
+```
+
+**What the seed service does**
+
+The seed container uses [Apache Bench](https://httpd.apache.org/docs/current/programs/ab.html) (`ab`) to POST votes directly to the vote service's HTTP endpoint. The `make-data.py` script pre-generates two URL-encoded POST body files (`posta` and `postb`) at image build time, then `generate-votes.sh` runs three `ab` commands:
+
+```bash
+#!/bin/sh
+
+# create 3000 votes (2000 for option a, 1000 for option b)
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p postb -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+```
+
+This submits **3000 total votes** — 2000 for option A and 1000 for option B — with a concurrency of 50 requests at a time. Because `restart: "no"` is set, the container exits after the script completes and does not run again on subsequent `docker compose up` calls.
+
+## Modifying Service Code
+
+<Accordion title="Vote service (Python)">
+  The `docker-compose.yml` mounts the local `./vote` directory into the container:
+
+  ```yaml
+  vote:
+    build:
+      context: ./vote
+      target: dev
+    volumes:
+      - ./vote:/usr/local/app
+  ```
+
+  The image is built with the `dev` target, which runs the application under Gunicorn with a file watcher. Edits to `vote/app.py` or templates take effect without restarting the container.
+</Accordion>
+
+<Accordion title="Result service (Node.js)">
+  The result service mounts `./result` and uses `nodemon` as its entrypoint:
+
+  ```yaml
+  result:
+    build: ./result
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    volumes:
+      - ./result:/usr/local/app
+  ```
+
+  `nodemon` watches for file changes and automatically restarts the Node process. The `--inspect` flag also exposes the V8 debugger on port `9229` (bound to `127.0.0.1` on the host) so you can attach a debugger.
+</Accordion>
+
+<Accordion title="Worker service (.NET)">
+  The worker does not have a volume mount in `docker-compose.yml`. Code changes require a rebuild:
+
+  ```bash
+  docker compose build worker
+  docker compose up -d worker
+  ```
+</Accordion>
+
+## Rebuilding Images
+
+After making changes that are not covered by a live volume mount, rebuild images before restarting:
+
+```bash
+# Rebuild all images
+docker compose build
+
+# Rebuild and restart in one step
+docker compose up --build
+
+# Rebuild a specific service only
+docker compose build vote
+```
+
+## Changing PostgreSQL Credentials
+
+The default credentials are `postgres` / `postgres`. They are set on the `db` service and must be kept in sync with the worker and result connection strings.
+
+<CodeGroup>
+
+```yaml docker-compose.yml
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "myuser"
+      POSTGRES_PASSWORD: "mysecretpassword"
+```
+
+```csharp worker/Program.cs
+// Update the connection string in OpenDbConnection calls
+var pgsql = OpenDbConnection("Server=db;Username=myuser;Password=mysecretpassword;");
+```
+
+```javascript result/server.js
+// Update the connection string in the Pool constructor
+var pool = new Pool({
+  connectionString: 'postgres://myuser:mysecretpassword@db/postgres'
+});
+```
+
+</CodeGroup>
+
+<Warning>
+  Changing credentials on an existing `db-data` volume will not update the PostgreSQL user inside the volume. Either drop the named volume first (`docker volume rm <project>_db-data`) or connect to the running database and update the user password with `ALTER USER`.
+</Warning>
+
+## Using Pre-built Images (Swarm)
+
+The `docker-stack.yml` file references pre-built images published to Docker Hub rather than building locally. These are the same images used in the repository's CI pipeline.
+
+| Service | Image |
+|---|---|
+| vote | `dockersamples/examplevotingapp_vote` |
+| result | `dockersamples/examplevotingapp_result` |
+| worker | `dockersamples/examplevotingapp_worker` |
+
+```yaml
+services:
+  vote:
+    image: dockersamples/examplevotingapp_vote
+    ports:
+      - 8080:80
+    deploy:
+      replicas: 2
+
+  result:
+    image: dockersamples/examplevotingapp_result
+    ports:
+      - 8081:80
+
+  worker:
+    image: dockersamples/examplevotingapp_worker
+    deploy:
+      replicas: 2
+```
+
+To deploy with these images to a Swarm cluster:
+
+```bash
+docker stack deploy --compose-file docker-stack.yml vote
+```
+
+<Tip>
+  If you have customized the application code and want to deploy to Swarm, build and push your own images to a registry, then update the `image` fields in `docker-stack.yml` to point to your registry before running `docker stack deploy`.
+</Tip>

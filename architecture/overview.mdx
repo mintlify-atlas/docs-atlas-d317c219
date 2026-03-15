@@ -1,0 +1,74 @@
+---
+title: Architecture Overview
+description: A high-level look at how the five services of the Example Voting App fit together as a distributed system.
+---
+
+The Example Voting App is a simple distributed application composed of five independent services written in three different languages. Each service has a single responsibility, and they communicate through well-defined interfaces — an in-memory queue and a relational database — rather than calling each other directly.
+
+<Note>
+  This is an intentionally simple demonstration of distributed concepts (queues, persistent storage, polyglot services) rather than a production-grade reference architecture.
+</Note>
+
+## Data flow
+
+A vote travels through the system in a fixed sequence:
+
+<Steps>
+  <Step title="User casts a vote">
+    A browser submits a form to the **vote** service (Python/Flask) on port 8080. The service reads the `voter_id` cookie — or mints a new one — to identify the browser, then pushes a JSON payload onto the Redis `votes` list with `rpush`.
+  </Step>
+  <Step title="Redis buffers the vote">
+    **Redis** holds the vote as an entry in its `votes` list. It acts purely as a queue: no processing, no persistence beyond its in-memory state.
+  </Step>
+  <Step title="Worker drains the queue">
+    The **.NET worker** continuously pops entries off the `votes` list with `ListLeftPopAsync`. For each entry it either inserts a new row into PostgreSQL or updates an existing one (keyed on `voter_id`).
+  </Step>
+  <Step title="PostgreSQL persists results">
+    **PostgreSQL** stores the canonical vote per browser in a `votes` table (`id VARCHAR UNIQUE, vote VARCHAR`). Because `voter_id` is the primary key, each browser can hold at most one vote and changing the selection overwrites the previous one.
+  </Step>
+  <Step title="Result service reads and streams">
+    The **result** service (Node.js/Express) queries PostgreSQL every second with `SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote` and pushes the totals to all connected browsers over a Socket.IO connection.
+  </Step>
+  <Step title="Browser displays live results">
+    The browser receives score updates in real time via Socket.IO and re-renders the result page without polling.
+  </Step>
+</Steps>
+
+## Architecture diagram
+
+An Excalidraw diagram (`architecture.excalidraw.png`) is included in the repository root and shows the full service topology. Open it in any Excalidraw-compatible viewer for an interactive view.
+
+## Key design decisions
+
+**Redis as a queue, not a database.**  
+Redis provides a fast, low-latency buffer between the user-facing vote service and the slower write path to PostgreSQL. The vote service never blocks on a database write; it simply appends to the Redis list and returns a response to the browser immediately.
+
+**Separate worker process.**  
+Isolating the queue-consumer logic into its own process means the vote service stays stateless and horizontally scalable. The worker can be scaled independently and can safely reconnect to both Redis and PostgreSQL if either restarts.
+
+**One vote per browser cookie.**  
+The vote service generates a random 64-bit `voter_id` and stores it in a cookie. The PostgreSQL schema enforces `id VARCHAR UNIQUE`, so the worker's upsert logic (INSERT, fallback to UPDATE on `DbException`) guarantees each `voter_id` maps to exactly one row — changing your vote updates the existing row rather than adding a new one.
+
+**Polyglot by design.**  
+The three application services deliberately use different languages (Python, Node.js, C#) to illustrate that services only need to agree on the shared queue and database schema, not on implementation language or framework.
+
+## Services at a glance
+
+| Service | Technology | Exposed port | Role |
+|---------|-----------|-------------|------|
+| **vote** | Python 3 / Flask / Gunicorn | 8080 → 80 | Accepts votes from browsers, enqueues to Redis |
+| **result** | Node.js / Express / Socket.IO | 8081 → 80 | Reads tallies from PostgreSQL, streams to browsers |
+| **worker** | .NET / C# | — (no port) | Drains Redis queue, writes to PostgreSQL |
+| **redis** | Redis (alpine) | 6379 (internal) | In-memory list queue for pending votes |
+| **db** | PostgreSQL 15 (alpine) | 5432 (internal) | Persistent vote storage |
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Services" href="/architecture/services">
+    Implementation details for each service — code snippets, environment variables, health checks, and dependencies.
+  </Card>
+  <Card title="Networking" href="/architecture/networking">
+    Network topology for Docker Compose, Docker Swarm, and Kubernetes — tiers, port mappings, and service discovery.
+  </Card>
+</CardGroup>

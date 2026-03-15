@@ -1,0 +1,223 @@
+---
+title: Health Checks
+description: How the Example Voting App uses Docker health checks to sequence service startup and handle connection failures.
+---
+
+The voting app has five services that depend on each other in a specific order. Without health checks, a service like `worker` could start before Redis or PostgreSQL is ready to accept connections, causing immediate failures. Docker Compose's `depends_on` with `condition: service_healthy` solves this by waiting until a dependency passes its health check before starting dependent services.
+
+## Startup Sequencing
+
+<Steps>
+  <Step title="Redis and PostgreSQL start first">
+    Both infrastructure services start and begin running their health check scripts on a 5-second interval. No application service starts until these pass.
+  </Step>
+  <Step title="Vote, result, and worker start">
+    Once Redis reports healthy, the `vote` and `worker` services start. Once PostgreSQL reports healthy, `result` and `worker` start. The `worker` waits for both Redis and PostgreSQL to be healthy before it is created.
+
+    ```yaml
+    worker:
+      depends_on:
+        redis:
+          condition: service_healthy
+        db:
+          condition: service_healthy
+    ```
+  </Step>
+  <Step title="Vote service becomes healthy">
+    After starting, the `vote` service itself runs its own HTTP health check every 15 seconds. It has a 10-second start period before failures begin counting.
+  </Step>
+  <Step title="Seed service starts (optional)">
+    If the `seed` profile is active, the seed container waits until the `vote` service itself passes its health check before submitting test votes.
+
+    ```yaml
+    seed:
+      depends_on:
+        vote:
+          condition: service_healthy
+    ```
+  </Step>
+</Steps>
+
+## Health Check Scripts
+
+### Redis
+
+The Redis health check is a shell script mounted into the container at `/healthchecks/redis.sh`.
+
+```bash
+#!/bin/sh
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+
+if ping="$(redis-cli -h "$host" ping)" && [ "$ping" = 'PONG' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+The script resolves the container's IP address and runs `redis-cli ping`. Redis responds with `PONG` when it is ready to accept commands. Any other response or a connection error causes the script to exit with code `1`, marking the container as unhealthy.
+
+The check runs every **5 seconds** with no explicit timeout or retry limit — Docker applies its defaults.
+
+```yaml
+redis:
+  image: redis:alpine
+  volumes:
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/redis.sh
+    interval: "5s"
+```
+
+### PostgreSQL
+
+The PostgreSQL health check connects to the database over TCP (not the Unix socket) and executes `SELECT 1`.
+
+```bash
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+	# force postgres to not use the local unix socket (test "external" connectibility)
+	--host "$host"
+	--username "$user"
+	--dbname "$db"
+	--quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+The script reads `POSTGRES_USER` and `POSTGRES_PASSWORD` from environment variables (falling back to `postgres`) so the credentials stay consistent with the service configuration. It forces a TCP connection rather than a Unix socket to verify that PostgreSQL is actually accepting network connections — the same path the worker and result services use.
+
+The check also runs every **5 seconds**.
+
+```yaml
+db:
+  image: postgres:15-alpine
+  environment:
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "postgres"
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/postgres.sh
+    interval: "5s"
+```
+
+### Vote service
+
+The vote service uses `curl` to check its own HTTP endpoint.
+
+```yaml
+vote:
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+```
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `interval` | 15s | Check runs every 15 seconds |
+| `timeout` | 5s | curl must respond within 5 seconds |
+| `retries` | 3 | Three consecutive failures mark it unhealthy |
+| `start_period` | 10s | Failures in the first 10 seconds don't count |
+
+The `-f` flag tells curl to return a non-zero exit code on HTTP 4xx/5xx responses, not just network errors.
+
+## All Services at a Glance
+
+| Service | Health check | Interval | Depended on by |
+|---|---|---|---|
+| `redis` | `redis-cli ping` → `PONG` | 5s | `vote`, `worker` |
+| `db` (PostgreSQL) | `SELECT 1` via psql | 5s | `result`, `worker` |
+| `vote` | `curl -f http://localhost` | 15s | `seed` |
+| `result` | None (uses retry loop) | — | — |
+| `worker` | None (uses retry loop) | — | — |
+
+## Resilience After Startup
+
+Health checks govern startup order, but the application services also handle connection drops at runtime without crashing.
+
+### Worker reconnect logic
+
+The .NET worker polls Redis every 100ms. Before each dequeue operation it checks whether the Redis connection is still live and whether the PostgreSQL connection is open. If either has dropped, it reconnects before processing the vote.
+
+```csharp
+while (true)
+{
+    // Slow down to prevent CPU spike, only query each 100ms
+    Thread.Sleep(100);
+
+    // Reconnect redis if down
+    if (redisConn == null || !redisConn.IsConnected) {
+        Console.WriteLine("Reconnecting Redis");
+        redisConn = OpenRedisConnection("redis");
+        redis = redisConn.GetDatabase();
+    }
+    string json = redis.ListLeftPopAsync("votes").Result;
+    if (json != null)
+    {
+        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+        // Reconnect DB if down
+        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+        {
+            Console.WriteLine("Reconnecting DB");
+            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+        }
+        else
+        { // Normal +1 vote requested
+            UpdateVote(pgsql, vote.voter_id, vote.vote);
+        }
+    }
+    else
+    {
+        keepAliveCommand.ExecuteNonQuery();
+    }
+}
+```
+
+The `OpenDbConnection` and `OpenRedisConnection` methods themselves loop indefinitely on `SocketException` / `DbException` / `RedisConnectionException`, sleeping 1 second between attempts, so a transient outage is handled automatically.
+
+### Result service retry loop
+
+The Node.js result service uses the `async.retry` helper to keep attempting a PostgreSQL connection before starting to serve data. It retries up to **1000 times** with a **1-second interval** between attempts.
+
+```javascript
+async.retry(
+  {times: 1000, interval: 1000},
+  function(callback) {
+    pool.connect(function(err, client, done) {
+      if (err) {
+        console.error("Waiting for db");
+      }
+      callback(err, client);
+    });
+  },
+  function(err, client) {
+    if (err) {
+      return console.error("Giving up");
+    }
+    console.log("Connected to db");
+    getVotes(client);
+  }
+);
+```
+
+Once connected, `getVotes` re-queries PostgreSQL every second to push live score updates to the browser over Socket.IO.

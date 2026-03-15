@@ -1,97 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Example Voting App"
+description: "A simple distributed voting application demonstrating multi-container Docker deployments across Compose, Swarm, and Kubernetes."
 ---
 
-## Setting up
+A hands-on reference application showing how to build and run a distributed, multi-service application with Docker. It demonstrates real-world patterns for container networking, message queues, persistent storage, and multi-platform orchestration.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get the app running locally in minutes with Docker Compose.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Understand how the five services connect and communicate.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Deployment" icon="server" href="/deployment/docker-compose">
+    Deploy with Docker Compose, Swarm, or Kubernetes.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Services" icon="cubes" href="/services/vote">
+    Explore each service: vote, result, worker, Redis, and Postgres.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What is the Example Voting App?
 
-Everything you need to create world-class documentation.
+The Example Voting App is a reference distributed application maintained by Docker. It is intentionally simple — its purpose is to demonstrate how to connect multiple containerized services together using Docker tooling, not to serve as a production-ready application template.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+The app lets users vote between two options (default: Cats vs Dogs) and view live results. Votes are submitted through a Python web app, queued in Redis, processed by a .NET worker, stored in PostgreSQL, and displayed in real time by a Node.js results app.
 
-## Need inspiration?
+## Key concepts demonstrated
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={3}>
+  <Card title="Multi-container networking" icon="network-wired">
+    Services communicate over isolated Docker bridge networks with front-tier and back-tier separation.
+  </Card>
+  <Card title="Message queue pattern" icon="list">
+    The vote service publishes to a Redis list; the worker consumes it asynchronously.
+  </Card>
+  <Card title="Persistent storage" icon="database">
+    PostgreSQL uses a named Docker volume so vote data survives container restarts.
+  </Card>
+  <Card title="Health checks" icon="heart-pulse">
+    Redis and Postgres expose shell-based health checks so dependent services wait for readiness.
+  </Card>
+  <Card title="Real-time updates" icon="bolt">
+    The result service uses Socket.IO to push live vote counts to the browser without polling.
+  </Card>
+  <Card title="Multi-platform deployment" icon="layer-group">
+    The same application runs on Docker Compose, Docker Swarm, and Kubernetes.
+  </Card>
+</CardGroup>
+
+## Application stack
+
+| Service | Technology | Role |
+|---------|-----------|------|
+| vote | Python / Flask | Front-end voting interface |
+| result | Node.js / Express | Real-time results display |
+| worker | .NET / C# | Vote queue consumer |
+| redis | Redis (alpine) | In-memory vote queue |
+| db | PostgreSQL 15 | Persistent vote storage |
+
+## Deployment options
+
+<CardGroup cols={3}>
+  <Card title="Docker Compose" icon="docker" href="/deployment/docker-compose">
+    Best for local development. Runs all services with a single command.
+  </Card>
+  <Card title="Docker Swarm" icon="circle-nodes" href="/deployment/docker-swarm">
+    For multi-node clusters. Supports replicated services and overlay networking.
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/deployment/kubernetes">
+    Full k8s YAML specs included for deployments and services.
+  </Card>
+</CardGroup>

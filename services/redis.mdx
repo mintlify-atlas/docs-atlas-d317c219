@@ -1,0 +1,110 @@
+---
+title: Redis Service
+description: In-memory message queue that buffers votes between the vote front-end and the worker.
+---
+
+Redis acts as the message queue between the vote service and the worker service. Votes are pushed onto a Redis list by the vote app and popped off one at a time by the worker.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Image" icon="box">
+    `redis:alpine`
+  </Card>
+  <Card title="Exposed ports" icon="server">
+    None — `back-tier` network only
+  </Card>
+  <Card title="Data structure" icon="database">
+    List — key `votes`
+  </Card>
+  <Card title="Persistence" icon="hard-drive">
+    None — data is held in memory only
+  </Card>
+</CardGroup>
+
+## Role in the architecture
+
+Redis serves as a decoupling layer between the stateless vote web app and the stateful worker:
+
+- The **vote service** calls `RPUSH votes <json>` on every form submission, appending to the right end of the list.
+- The **worker service** calls `LPOP votes` (via `ListLeftPopAsync`) every 100 ms, consuming from the left end.
+
+This FIFO queue means votes are processed in submission order. Because Redis holds votes only until the worker pops them, **no vote data is persisted in Redis** — the authoritative store is PostgreSQL.
+
+<Warning>
+  If the worker is stopped while votes are being cast, those votes accumulate in Redis memory. They will be processed when the worker restarts, but they are lost if the Redis container is removed before that happens.
+</Warning>
+
+## Connection details
+
+Other services connect to Redis using its Docker service name as the hostname:
+
+| Field | Value |
+|---|---|
+| Hostname | `redis` |
+| Port | `6379` (default) |
+| Database | `0` (default) |
+
+The vote service sets `socket_timeout=5` seconds. The worker resolves the hostname to an IP address before connecting (see the [Worker service](/services/worker) page for details).
+
+## Health check
+
+The Redis container mounts the local `./healthchecks` directory and uses a custom shell script for its health check:
+
+```yaml
+volumes:
+  - "./healthchecks:/healthchecks"
+healthcheck:
+  test: /healthchecks/redis.sh
+  interval: "5s"
+```
+
+### healthchecks/redis.sh
+
+```bash
+#!/bin/sh
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+
+if ping="$(redis-cli -h "$host" ping)" && [ "$ping" = 'PONG' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+The script uses `hostname -i` to resolve the container's own IP address, then runs `redis-cli ping`. Redis replies with `PONG` when it is ready to accept connections; any other response or error causes the script to exit with code `1`, marking the container as unhealthy.
+
+<Note>
+  Both the vote service and the worker service declare `depends_on: redis: condition: service_healthy`. Docker Compose will not start those containers until this health check passes.
+</Note>
+
+## Docker Compose configuration
+
+```yaml
+redis:
+  image: redis:alpine
+  volumes:
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/redis.sh
+    interval: "5s"
+  networks:
+    - back-tier
+```
+
+Redis is attached only to the `back-tier` network. There is no port mapping to the host, so it is not directly reachable from outside the Compose project.
+
+## Data flow summary
+
+```
+vote service  ──RPUSH votes──►  Redis list "votes"  ──LPOP──►  worker service
+                                  (transient buffer)
+```
+
+Each list element is a JSON string in the format:
+
+```json
+{"voter_id": "a3f2c1d8...", "vote": "a"}
+```

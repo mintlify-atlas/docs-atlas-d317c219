@@ -1,0 +1,258 @@
+---
+title: Result Service
+description: Node.js/Express application that displays real-time vote tallies using Socket.IO and PostgreSQL.
+---
+
+The result service is a [Node.js](https://nodejs.org/) application built with Express and Socket.IO. It continuously polls PostgreSQL for the latest vote counts and pushes the updated totals to every connected browser in real time.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="js">
+    Node.js 18 (Express + Socket.IO)
+  </Card>
+  <Card title="Container port" icon="server">
+    80 (mapped to **8081** on the host)
+  </Card>
+  <Card title="Upstream dependency" icon="database">
+    PostgreSQL — connection string `postgres://postgres:postgres@db/postgres`
+  </Card>
+  <Card title="Networks" icon="network-wired">
+    `front-tier` and `back-tier`
+  </Card>
+</CardGroup>
+
+## How it works
+
+### HTTP and static files
+
+Express serves static assets from the `./views` directory and exposes a root route:
+
+```javascript
+app.use(express.static(__dirname + '/views'));
+
+app.get('/', function (req, res) {
+  res.sendFile(path.resolve(__dirname + '/views/index.html'));
+});
+```
+
+### Real-time results with Socket.IO
+
+When a browser connects, the server emits a `message` event and listens for a `subscribe` event that places the socket into a named channel:
+
+```javascript
+io.on('connection', function (socket) {
+  socket.emit('message', { text : 'Welcome!' });
+
+  socket.on('subscribe', function (data) {
+    socket.join(data.channel);
+  });
+});
+```
+
+### PostgreSQL polling
+
+Once the database connection is established, `getVotes` runs the following query every second and broadcasts the result to all connected sockets:
+
+```javascript
+client.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function(err, result) {
+  if (err) {
+    console.error("Error performing query: " + err);
+  } else {
+    var votes = collectVotesFromResult(result);
+    io.sockets.emit("scores", JSON.stringify(votes));
+  }
+
+  setTimeout(function() {getVotes(client) }, 1000);
+});
+```
+
+The `scores` event payload is a JSON object with the total count for each option:
+
+```json
+{"a": 42, "b": 17}
+```
+
+### Database connection retry
+
+The service retries the PostgreSQL connection up to 1000 times with a 1-second interval using the `async` library:
+
+```javascript
+var pool = new Pool({
+  connectionString: 'postgres://postgres:postgres@db/postgres'
+});
+
+async.retry(
+  {times: 1000, interval: 1000},
+  function(callback) {
+    pool.connect(function(err, client, done) {
+      if (err) {
+        console.error("Waiting for db");
+      }
+      callback(err, client);
+    });
+  },
+  function(err, client) {
+    if (err) {
+      return console.error("Giving up");
+    }
+    console.log("Connected to db");
+    getVotes(client);
+  }
+);
+```
+
+<Note>
+  The result service depends on `db` being healthy (`condition: service_healthy`) before it starts. The retry loop provides an additional safety net during startup.
+</Note>
+
+## Full source — server.js
+
+```javascript
+var express = require('express'),
+    async = require('async'),
+    { Pool } = require('pg'),
+    cookieParser = require('cookie-parser'),
+    app = express(),
+    server = require('http').Server(app),
+    io = require('socket.io')(server);
+
+var port = process.env.PORT || 4000;
+
+io.on('connection', function (socket) {
+
+  socket.emit('message', { text : 'Welcome!' });
+
+  socket.on('subscribe', function (data) {
+    socket.join(data.channel);
+  });
+});
+
+var pool = new Pool({
+  connectionString: 'postgres://postgres:postgres@db/postgres'
+});
+
+async.retry(
+  {times: 1000, interval: 1000},
+  function(callback) {
+    pool.connect(function(err, client, done) {
+      if (err) {
+        console.error("Waiting for db");
+      }
+      callback(err, client);
+    });
+  },
+  function(err, client) {
+    if (err) {
+      return console.error("Giving up");
+    }
+    console.log("Connected to db");
+    getVotes(client);
+  }
+);
+
+function getVotes(client) {
+  client.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function(err, result) {
+    if (err) {
+      console.error("Error performing query: " + err);
+    } else {
+      var votes = collectVotesFromResult(result);
+      io.sockets.emit("scores", JSON.stringify(votes));
+    }
+
+    setTimeout(function() {getVotes(client) }, 1000);
+  });
+}
+
+function collectVotesFromResult(result) {
+  var votes = {a: 0, b: 0};
+
+  result.rows.forEach(function (row) {
+    votes[row.vote] = parseInt(row.count);
+  });
+
+  return votes;
+}
+
+app.use(cookieParser());
+app.use(express.urlencoded());
+app.use(express.static(__dirname + '/views'));
+
+app.get('/', function (req, res) {
+  res.sendFile(path.resolve(__dirname + '/views/index.html'));
+});
+
+server.listen(port, function () {
+  var port = server.address().port;
+  console.log('App running on port ' + port);
+});
+```
+
+## Dockerfile
+
+```dockerfile
+FROM node:18-slim
+
+# add curl for healthcheck
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl tini && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/local/app
+
+# have nodemon available for local dev use (file watching)
+RUN npm install -g nodemon
+
+COPY package*.json ./
+
+RUN npm ci && \
+ npm cache clean --force && \
+ mv /usr/local/app/node_modules /node_modules
+
+COPY . .
+
+ENV PORT=80
+EXPOSE 80
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+[`tini`](https://github.com/krallin/tini) is used as the container init process to handle signal forwarding and zombie process reaping.
+
+## Node.js dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `express` | ^4.18.2 | HTTP server and static file serving |
+| `socket.io` | ^4.7.2 | WebSocket-based real-time communication |
+| `pg` | ^8.8.0 | PostgreSQL client (`Pool`) |
+| `async` | ^3.1.0 | Connection retry logic |
+| `cookie-parser` | ^1.4.6 | Cookie middleware |
+| `method-override` | ^3.0.0 | HTTP method override support |
+| `stoppable` | ^1.1.0 | Graceful server shutdown |
+
+## Docker Compose configuration
+
+<AccordionGroup>
+  <Accordion title="Ports">
+    | Host port | Container port | Purpose |
+    |---|---|---|
+    | `8081` | `80` | Results web UI |
+    | `127.0.0.1:9229` | `9229` | Node.js inspector (loopback only) |
+
+    Port 9229 is bound to `127.0.0.1` so that the debugger is not accessible from other hosts on the network.
+  </Accordion>
+  <Accordion title="Development entrypoint">
+    In the Compose file the default `CMD` is overridden for local development:
+
+    ```yaml
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    ```
+
+    `nodemon` watches for file changes and restarts the server automatically. The `--inspect` flag enables the Node.js debugger on all interfaces inside the container (port 9229 is still only forwarded to localhost on the host).
+  </Accordion>
+  <Accordion title="Volume mount">
+    `./result:/usr/local/app` mounts the local source tree into the container so that `nodemon` picks up edits without a rebuild.
+  </Accordion>
+</AccordionGroup>

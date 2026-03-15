@@ -1,0 +1,320 @@
+---
+title: Worker Service
+description: .NET C# background service that reads votes from Redis and persists them to PostgreSQL.
+---
+
+The worker is a headless .NET 7 console application. It sits entirely on the `back-tier` network with no exposed ports, continuously draining the Redis `votes` list and upserting each vote into PostgreSQL.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="code">
+    C# / .NET 7
+  </Card>
+  <Card title="Exposed ports" icon="server">
+    None — internal back-tier only
+  </Card>
+  <Card title="Reads from" icon="database">
+    Redis list `votes` (LPOP)
+  </Card>
+  <Card title="Writes to" icon="database">
+    PostgreSQL table `votes` (upsert)
+  </Card>
+</CardGroup>
+
+## How it works
+
+### Startup sequence
+
+1. Opens a Npgsql connection to PostgreSQL, retrying until it succeeds.
+2. Creates the `votes` table if it does not already exist.
+3. Resolves the Redis hostname to an IP address (see note below) and opens a `StackExchange.Redis` `ConnectionMultiplexer`.
+
+### Main processing loop
+
+The worker enters an infinite loop with a 100 ms sleep on each iteration to avoid pegging the CPU:
+
+```csharp
+while (true)
+{
+    // Slow down to prevent CPU spike, only query each 100ms
+    Thread.Sleep(100);
+
+    // Reconnect redis if down
+    if (redisConn == null || !redisConn.IsConnected) {
+        Console.WriteLine("Reconnecting Redis");
+        redisConn = OpenRedisConnection("redis");
+        redis = redisConn.GetDatabase();
+    }
+    string json = redis.ListLeftPopAsync("votes").Result;
+    if (json != null)
+    {
+        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+        // Reconnect DB if down
+        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+        {
+            Console.WriteLine("Reconnecting DB");
+            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+        }
+        else
+        { // Normal +1 vote requested
+            UpdateVote(pgsql, vote.voter_id, vote.vote);
+        }
+    }
+    else
+    {
+        keepAliveCommand.ExecuteNonQuery();
+    }
+}
+```
+
+When the Redis list is empty (no pending votes), the worker executes a `SELECT 1` keepalive against PostgreSQL to prevent the idle connection from being closed by the database server.
+
+### Vote upsert
+
+The `voter_id` from the cookie is used as the row identifier. The worker first attempts an `INSERT`; if the row already exists (duplicate `voter_id`), the caught `DbException` triggers an `UPDATE` instead:
+
+```csharp
+private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+{
+    var command = connection.CreateCommand();
+    try
+    {
+        command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+        command.Parameters.AddWithValue("@id", voterId);
+        command.Parameters.AddWithValue("@vote", vote);
+        command.ExecuteNonQuery();
+    }
+    catch (DbException)
+    {
+        command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+        command.ExecuteNonQuery();
+    }
+    finally
+    {
+        command.Dispose();
+    }
+}
+```
+
+### Redis connection — IP address workaround
+
+`StackExchange.Redis` has a known issue with DNS-based hostname resolution in some environments. The worker works around this by resolving the hostname to an IPv4 address before connecting:
+
+```csharp
+private static string GetIp(string hostname)
+    => Dns.GetHostEntryAsync(hostname)
+        .Result
+        .AddressList
+        .First(a => a.AddressFamily == AddressFamily.InterNetwork)
+        .ToString();
+```
+
+<Note>
+  This workaround addresses [StackExchange.Redis issue #410](https://github.com/StackExchange/StackExchange.Redis/issues/410). The worker calls `GetIp("redis")` and connects to the resolved IP rather than the hostname string.
+</Note>
+
+### Reconnection handling
+
+Both the Redis and PostgreSQL connections are checked on every loop iteration and re-established automatically if they have dropped:
+
+- **Redis:** checked via `redisConn.IsConnected`
+- **PostgreSQL:** checked via `pgsql.State.Equals(System.Data.ConnectionState.Open)`
+
+## Full source — Program.cs
+
+```csharp
+using System;
+using System.Data.Common;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using Newtonsoft.Json;
+using Npgsql;
+using StackExchange.Redis;
+
+namespace Worker
+{
+    public class Program
+    {
+        public static int Main(string[] args)
+        {
+            try
+            {
+                var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+                var redisConn = OpenRedisConnection("redis");
+                var redis = redisConn.GetDatabase();
+
+                // Keep alive is not implemented in Npgsql yet. This workaround was recommended:
+                // https://github.com/npgsql/npgsql/issues/1214#issuecomment-235828359
+                var keepAliveCommand = pgsql.CreateCommand();
+                keepAliveCommand.CommandText = "SELECT 1";
+
+                var definition = new { vote = "", voter_id = "" };
+                while (true)
+                {
+                    // Slow down to prevent CPU spike, only query each 100ms
+                    Thread.Sleep(100);
+
+                    // Reconnect redis if down
+                    if (redisConn == null || !redisConn.IsConnected) {
+                        Console.WriteLine("Reconnecting Redis");
+                        redisConn = OpenRedisConnection("redis");
+                        redis = redisConn.GetDatabase();
+                    }
+                    string json = redis.ListLeftPopAsync("votes").Result;
+                    if (json != null)
+                    {
+                        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+                        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+                        // Reconnect DB if down
+                        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+                        {
+                            Console.WriteLine("Reconnecting DB");
+                            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+                        }
+                        else
+                        { // Normal +1 vote requested
+                            UpdateVote(pgsql, vote.voter_id, vote.vote);
+                        }
+                    }
+                    else
+                    {
+                        keepAliveCommand.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.ToString());
+                return 1;
+            }
+        }
+
+        private static NpgsqlConnection OpenDbConnection(string connectionString)
+        {
+            NpgsqlConnection connection;
+
+            while (true)
+            {
+                try
+                {
+                    connection = new NpgsqlConnection(connectionString);
+                    connection.Open();
+                    break;
+                }
+                catch (SocketException)
+                {
+                    Console.Error.WriteLine("Waiting for db");
+                    Thread.Sleep(1000);
+                }
+                catch (DbException)
+                {
+                    Console.Error.WriteLine("Waiting for db");
+                    Thread.Sleep(1000);
+                }
+            }
+
+            Console.Error.WriteLine("Connected to db");
+
+            var command = connection.CreateCommand();
+            command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
+                                        id VARCHAR(255) NOT NULL UNIQUE,
+                                        vote VARCHAR(255) NOT NULL
+                                    )";
+            command.ExecuteNonQuery();
+
+            return connection;
+        }
+
+        private static ConnectionMultiplexer OpenRedisConnection(string hostname)
+        {
+            // Use IP address to workaround https://github.com/StackExchange/StackExchange.Redis/issues/410
+            var ipAddress = GetIp(hostname);
+            Console.WriteLine($"Found redis at {ipAddress}");
+
+            while (true)
+            {
+                try
+                {
+                    Console.Error.WriteLine("Connecting to redis");
+                    return ConnectionMultiplexer.Connect(ipAddress);
+                }
+                catch (RedisConnectionException)
+                {
+                    Console.Error.WriteLine("Waiting for redis");
+                    Thread.Sleep(1000);
+                }
+            }
+        }
+
+        private static string GetIp(string hostname)
+            => Dns.GetHostEntryAsync(hostname)
+                .Result
+                .AddressList
+                .First(a => a.AddressFamily == AddressFamily.InterNetwork)
+                .ToString();
+
+        private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+        {
+            var command = connection.CreateCommand();
+            try
+            {
+                command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+                command.Parameters.AddWithValue("@id", voterId);
+                command.Parameters.AddWithValue("@vote", vote);
+                command.ExecuteNonQuery();
+            }
+            catch (DbException)
+            {
+                command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+                command.ExecuteNonQuery();
+            }
+            finally
+            {
+                command.Dispose();
+            }
+        }
+    }
+}
+```
+
+## Dockerfile
+
+The build uses a multi-stage Dockerfile targeting .NET 7. The first stage compiles and publishes the application; the second stage produces a lean runtime image:
+
+```dockerfile
+# build compiles the program for the builder's local platform
+FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/dotnet/sdk:7.0 AS build
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BUILDPLATFORM
+RUN echo "I am running on $BUILDPLATFORM, building for $TARGETPLATFORM"
+
+WORKDIR /source
+COPY *.csproj .
+RUN dotnet restore -a $TARGETARCH
+
+COPY . .
+RUN dotnet publish -c release -o /app -a $TARGETARCH --self-contained false --no-restore
+
+# app image
+FROM mcr.microsoft.com/dotnet/runtime:7.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "Worker.dll"]
+```
+
+<Tip>
+  The `--platform=${BUILDPLATFORM}` flag on the build stage means the SDK always runs natively on the builder's CPU. `$TARGETARCH` is passed through to `dotnet restore` and `dotnet publish` so the output binary targets the correct architecture.
+</Tip>
+
+## NuGet dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `StackExchange.Redis` | 2.2.4 | Redis client (`ConnectionMultiplexer`, `IDatabase`) |
+| `Npgsql` | 4.1.9 | PostgreSQL client (`NpgsqlConnection`) |
+| `Newtonsoft.Json` | 13.0.1 | JSON deserialisation of vote payloads |

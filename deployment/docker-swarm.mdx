@@ -1,0 +1,155 @@
+---
+title: Docker Swarm
+description: Deploy the Example Voting App as a Docker Swarm stack for multi-replica production-style deployments.
+---
+
+Docker Swarm mode lets you deploy the app as a stack with multiple replicas across one or more nodes. The included `docker-stack.yml` uses pre-built images from Docker Hub and is written in Compose v3.9 syntax, which is the format Swarm currently supports.
+
+<Note>
+  `docker-stack.yml` is **not** interchangeable with `docker-compose.yml`. Docker Swarm does not support Compose Spec syntax yet, so the stack file pins to `version: "3.9"`. Attempting to use `docker-stack.yml` with `docker compose up` will fail because multiple replicas cannot bind to the same host port simultaneously.
+</Note>
+
+## Prerequisites
+
+- Docker Engine installed on one or more nodes
+- Swarm mode initialized (see below)
+
+## Deploying the stack
+
+<Steps>
+  <Step title="Initialize a swarm">
+    If you don't already have a swarm, initialize one on your manager node:
+
+    ```bash
+    docker swarm init
+    ```
+
+    For a single-node swarm this is all that's needed. For multi-node setups, use the `docker swarm join` token printed by this command on each worker node.
+  </Step>
+
+  <Step title="Deploy the stack">
+    From the repository root:
+
+    ```bash
+    docker stack deploy --compose-file docker-stack.yml vote
+    ```
+
+    This creates the `vote` stack and pulls all images from Docker Hub. The stack name `vote` prefixes all service and network names.
+  </Step>
+
+  <Step title="Verify the services are running">
+    ```bash
+    docker stack services vote
+    ```
+
+    Wait until the `REPLICAS` column shows the expected counts for each service before proceeding.
+  </Step>
+
+  <Step title="Open the app">
+    | Interface | URL |
+    |-----------|-----|
+    | Voting    | http://localhost:8080 |
+    | Results   | http://localhost:8081 |
+
+    In a multi-node swarm, the ports are published on **all** nodes via the Swarm routing mesh, so you can reach the app through any node's IP address.
+  </Step>
+</Steps>
+
+## Stack configuration
+
+Full contents of `docker-stack.yml`:
+
+```yaml
+# this file is meant for Docker Swarm stacks only
+# trying it in compose will fail because of multiple replicas trying to bind to the same port
+# Swarm currently does not support Compose Spec, so we'll pin to the older version 3.9
+
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:alpine
+    networks:
+      - frontend
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - backend
+
+  vote:
+    image: dockersamples/examplevotingapp_vote
+    ports:
+      - 8080:80
+    networks:
+      - frontend
+    deploy:
+      replicas: 2
+
+  result:
+    image: dockersamples/examplevotingapp_result
+    ports:
+      - 8081:80
+    networks:
+      - backend
+
+  worker:
+    image: dockersamples/examplevotingapp_worker
+    networks:
+      - frontend
+      - backend
+    deploy:
+      replicas: 2
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  db-data:
+```
+
+## Service replicas
+
+| Service | Replicas | Network(s) |
+|---------|----------|------------|
+| `vote`  | 2        | frontend |
+| `result`| 1        | backend |
+| `worker`| 2        | frontend, backend |
+| `redis` | 1        | frontend |
+| `db`    | 1        | backend |
+
+The `vote` and `worker` services run two replicas each. Swarm distributes these across available nodes and load-balances incoming requests automatically.
+
+## Differences from Docker Compose
+
+| Feature | Docker Compose | Docker Swarm stack |
+|---------|---------------|--------------------|
+| Images | Built from source (`build:`) | Pre-built from Docker Hub |
+| Volume mounts | Local directories mounted for hot reload | No bind mounts; named volume for Postgres only |
+| Networks | `front-tier` / `back-tier` (bridge) | `frontend` / `backend` (overlay) |
+| Replicas | Single instance per service | Configurable via `deploy.replicas` |
+| Health checks | Defined with custom scripts | Not defined in stack file |
+| Profiles | `seed` profile available | Not included |
+
+<Tip>
+  Overlay networks span all Swarm nodes, allowing containers on different machines to communicate by service name.
+</Tip>
+
+## Removing the stack
+
+```bash
+docker stack rm vote
+```
+
+This removes all services, networks, and containers in the stack. The `db-data` volume is **not** removed automatically. To remove it:
+
+```bash
+docker volume rm vote_db-data
+```

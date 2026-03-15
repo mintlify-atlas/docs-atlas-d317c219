@@ -1,0 +1,331 @@
+---
+title: Services
+description: Detailed breakdown of every service in the Example Voting App — implementation, configuration, health checks, and inter-service dependencies.
+---
+
+The app is made up of five services. Three are application services written in different languages; two are off-the-shelf infrastructure services pulled from Docker Hub.
+
+<AccordionGroup>
+
+  <Accordion title="vote — Python Flask frontend">
+
+    The vote service presents a two-option ballot to the browser and enqueues each submission to Redis.
+
+    **Technology:** Python 3 · Flask · Gunicorn  
+    **Container port:** 80  
+    **Host port (Compose):** 8080
+
+    ### Environment variables
+
+    | Variable | Default | Purpose |
+    |----------|---------|----------|
+    | `OPTION_A` | `Cats` | Label for the first choice |
+    | `OPTION_B` | `Dogs` | Label for the second choice |
+
+    ### How it works
+
+    On a `GET` request the service reads (or creates) a `voter_id` cookie — a random 64-bit hex string — and renders the ballot template. On a `POST` request it serialises `{voter_id, vote}` as JSON and pushes it onto the Redis `votes` list:
+
+    ```python
+    option_a = os.getenv('OPTION_A', "Cats")
+    option_b = os.getenv('OPTION_B', "Dogs")
+
+    def get_redis():
+        if not hasattr(g, 'redis'):
+            g.redis = Redis(host="redis", db=0, socket_timeout=5)
+        return g.redis
+
+    @app.route("/", methods=['POST','GET'])
+    def hello():
+        voter_id = request.cookies.get('voter_id')
+        if not voter_id:
+            voter_id = hex(random.getrandbits(64))[2:-1]
+
+        vote = None
+
+        if request.method == 'POST':
+            redis = get_redis()
+            vote = request.form['vote']
+            app.logger.info('Received vote for %s', vote)
+            data = json.dumps({'voter_id': voter_id, 'vote': vote})
+            redis.rpush('votes', data)
+
+        resp = make_response(render_template(
+            'index.html',
+            option_a=option_a,
+            option_b=option_b,
+            hostname=hostname,
+            vote=vote,
+        ))
+        resp.set_cookie('voter_id', voter_id)
+        return resp
+    ```
+
+    ### Health check
+
+    Docker Compose polls `http://localhost` every 15 seconds (timeout 5 s, 3 retries, 10 s start period):
+
+    ```yaml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ```
+
+    ### Dependencies
+
+    Compose waits for the `redis` service to be **healthy** before starting `vote`.
+
+  </Accordion>
+
+  <Accordion title="result — Node.js results frontend">
+
+    The result service reads vote tallies from PostgreSQL every second and pushes them to every connected browser over Socket.IO.
+
+    **Technology:** Node.js · Express · Socket.IO · pg  
+    **Container port:** 80 (Express listens on `PORT` env var, defaulting to 4000 internally, but the container image remaps to 80)  
+    **Host ports (Compose):** 8081 → 80, 127.0.0.1:9229 → 9229 (Node.js inspector)
+
+    ### How it works
+
+    On startup the service retries the PostgreSQL connection up to 1000 times (1 s interval). Once connected it enters a polling loop:
+
+    ```javascript
+    var port = process.env.PORT || 4000;
+
+    var pool = new Pool({
+      connectionString: 'postgres://postgres:postgres@db/postgres'
+    });
+
+    async.retry(
+      {times: 1000, interval: 1000},
+      function(callback) {
+        pool.connect(function(err, client, done) {
+          if (err) { console.error("Waiting for db"); }
+          callback(err, client);
+        });
+      },
+      function(err, client) {
+        if (err) { return console.error("Giving up"); }
+        console.log("Connected to db");
+        getVotes(client);
+      }
+    );
+
+    function getVotes(client) {
+      client.query(
+        'SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote',
+        [],
+        function(err, result) {
+          if (err) {
+            console.error("Error performing query: " + err);
+          } else {
+            var votes = collectVotesFromResult(result);
+            io.sockets.emit("scores", JSON.stringify(votes));
+          }
+          setTimeout(function() { getVotes(client) }, 1000);
+        }
+      );
+    }
+    ```
+
+    Socket.IO emits a `scores` event to all connected clients every time the query completes, giving near-real-time updates without the browser needing to poll.
+
+    ### Local development
+
+    Compose overrides the entrypoint to use `nodemon` so the server restarts automatically on source changes:
+
+    ```yaml
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    ```
+
+    The `9229` port is bound only on `127.0.0.1` in Compose, making the Node.js inspector accessible locally without exposing it on all interfaces.
+
+    ### Dependencies
+
+    Compose waits for the `db` service to be **healthy** before starting `result`.
+
+  </Accordion>
+
+  <Accordion title="worker — .NET queue consumer">
+
+    The worker is a headless .NET console application that bridges Redis and PostgreSQL. It has no HTTP port.
+
+    **Technology:** .NET · C# · StackExchange.Redis · Npgsql
+
+    ### How it works
+
+    The worker opens connections to both Redis (by hostname `redis`) and PostgreSQL (by hostname `db`), then enters an infinite loop:
+
+    ```csharp
+    var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+    var redisConn = OpenRedisConnection("redis");
+    var redis = redisConn.GetDatabase();
+
+    var definition = new { vote = "", voter_id = "" };
+    while (true)
+    {
+        Thread.Sleep(100); // prevent CPU spike
+
+        // Reconnect redis if down
+        if (redisConn == null || !redisConn.IsConnected) {
+            Console.WriteLine("Reconnecting Redis");
+            redisConn = OpenRedisConnection("redis");
+            redis = redisConn.GetDatabase();
+        }
+        string json = redis.ListLeftPopAsync("votes").Result;
+        if (json != null)
+        {
+            var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+            Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+            if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+            {
+                Console.WriteLine("Reconnecting DB");
+                pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+            }
+            else
+            {
+                UpdateVote(pgsql, vote.voter_id, vote.vote);
+            }
+        }
+        else
+        {
+            keepAliveCommand.ExecuteNonQuery(); // SELECT 1
+        }
+    }
+    ```
+
+    ### Upsert logic
+
+    Because each `voter_id` maps to exactly one row, the worker first tries an `INSERT`. If the row already exists (the voter is changing their selection), a `DbException` is caught and an `UPDATE` is issued instead:
+
+    ```csharp
+    private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+    {
+        var command = connection.CreateCommand();
+        try
+        {
+            command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+            command.Parameters.AddWithValue("@id", voterId);
+            command.Parameters.AddWithValue("@vote", vote);
+            command.ExecuteNonQuery();
+        }
+        catch (DbException)
+        {
+            command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            command.Dispose();
+        }
+    }
+    ```
+
+    ### Database schema
+
+    The worker creates the table on first connection if it does not exist:
+
+    ```csharp
+    command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
+                                id VARCHAR(255) NOT NULL UNIQUE,
+                                vote VARCHAR(255) NOT NULL
+                            )";
+    command.ExecuteNonQuery();
+    ```
+
+    ### Connection resilience
+
+    Both `OpenDbConnection` and `OpenRedisConnection` retry indefinitely (sleeping 1 s between attempts) until the dependency is available. Inside the main loop, the worker also detects a dropped Redis connection and reconnects, and runs a `SELECT 1` keep-alive query against PostgreSQL when the queue is empty.
+
+    ### Dependencies
+
+    Compose waits for both `redis` and `db` to be **healthy** before starting `worker`.
+
+  </Accordion>
+
+  <Accordion title="redis — in-memory queue">
+
+    Redis is used exclusively as a list-based queue. The vote service pushes to the right of the list; the worker pops from the left.
+
+    **Image:** `redis:alpine`  
+    **Internal port:** 6379  
+    **Data model:** a single list key named `votes`
+
+    ### Queue operations
+
+    | Operation | Used by | Command |
+    |-----------|---------|----------|
+    | Enqueue vote | vote service | `RPUSH votes <json>` |
+    | Dequeue vote | worker | `LPOP votes` (via `ListLeftPopAsync`) |
+
+    ### Health check
+
+    Compose runs a custom shell script mounted from `./healthchecks/redis.sh` every 5 seconds:
+
+    ```yaml
+    healthcheck:
+      test: /healthchecks/redis.sh
+      interval: "5s"
+    ```
+
+    Both `vote` and `worker` declare `condition: service_healthy` on `redis`, so they will not start until this check passes.
+
+    <Note>
+      Redis has no persistent volume in the Compose configuration. If the Redis container is removed, any votes that were queued but not yet consumed by the worker are lost. In practice this window is small because the worker drains the queue continuously.
+    </Note>
+
+  </Accordion>
+
+  <Accordion title="db — PostgreSQL">
+
+    PostgreSQL provides durable, deduplicated vote storage.
+
+    **Image:** `postgres:15-alpine`  
+    **Internal port:** 5432  
+    **Volume:** named volume `db-data` → `/var/lib/postgresql/data`
+
+    ### Credentials
+
+    Set via environment variables in both Compose files:
+
+    ```yaml
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    ```
+
+    The connection strings in the worker (`Server=db;Username=postgres;Password=postgres;`) and result service (`postgres://postgres:postgres@db/postgres`) reference these values directly.
+
+    ### Schema
+
+    The worker creates the table on its first successful connection:
+
+    ```sql
+    CREATE TABLE IF NOT EXISTS votes (
+        id   VARCHAR(255) NOT NULL UNIQUE,
+        vote VARCHAR(255) NOT NULL
+    );
+    ```
+
+    The `UNIQUE` constraint on `id` (the `voter_id` cookie value) is what enforces one vote per browser and makes the worker's INSERT-then-UPDATE upsert pattern safe.
+
+    ### Health check
+
+    Compose runs `./healthchecks/postgres.sh` every 5 seconds. Both `result` and `worker` wait for this check before starting:
+
+    ```yaml
+    healthcheck:
+      test: /healthchecks/postgres.sh
+      interval: "5s"
+    ```
+
+    ### Persistence
+
+    The named volume `db-data` survives container restarts and `docker compose down` (without `--volumes`), so vote counts are retained across deployments.
+
+  </Accordion>
+
+</AccordionGroup>

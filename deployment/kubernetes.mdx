@@ -1,0 +1,306 @@
+---
+title: Kubernetes
+description: Deploy the Example Voting App to a Kubernetes cluster using the provided specifications.
+---
+
+The `k8s-specifications/` directory contains ready-to-use Kubernetes manifests for all five application components. Each component has a Deployment and (where applicable) a Service.
+
+## Prerequisites
+
+- A running Kubernetes cluster (local clusters like [kind](https://kind.sigs.k8s.io/) or [minikube](https://minikube.sigs.k8s.io/) work fine)
+- `kubectl` installed and configured to point at your cluster
+
+Verify your connection:
+
+```bash
+kubectl cluster-info
+```
+
+## Deploying the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Apply all specifications">
+    ```bash
+    kubectl create -f k8s-specifications/
+    ```
+
+    This creates all Deployments and Services in your current namespace (`default` unless you have changed your kubeconfig context).
+  </Step>
+
+  <Step title="Watch the pods come up">
+    ```bash
+    kubectl get pods --watch
+    ```
+
+    Wait until all pods show `Running` status before accessing the app.
+  </Step>
+
+  <Step title="Open the app">
+    | Interface | Access |
+    |-----------|--------|
+    | Voting    | `http://<node-ip>:31000` |
+    | Results   | `http://<node-ip>:31001` |
+
+    Replace `<node-ip>` with any node's IP address. For local clusters, this is often `localhost` or the address shown by `minikube ip` / `kubectl get nodes -o wide`.
+  </Step>
+</Steps>
+
+<Note>
+  All resources are created in the **current namespace** as determined by your active kubeconfig context. To deploy into a specific namespace, add `--namespace <name>` to the `kubectl create` command.
+</Note>
+
+## Kubernetes resources
+
+The table below lists every file in `k8s-specifications/` along with the resource it defines:
+
+| File | Kind | Name | Purpose |
+|------|------|------|---------|
+| `vote-deployment.yaml` | Deployment | `vote` | Runs the Python voting frontend (port 80) |
+| `vote-service.yaml` | Service (NodePort) | `vote` | Exposes voting UI on NodePort 31000 |
+| `result-deployment.yaml` | Deployment | `result` | Runs the Node.js results frontend (port 80) |
+| `result-service.yaml` | Service (NodePort) | `result` | Exposes results UI on NodePort 31001 |
+| `worker-deployment.yaml` | Deployment | `worker` | Runs the background vote-processing worker |
+| `redis-deployment.yaml` | Deployment | `redis` | Runs Redis for the vote queue (port 6379) |
+| `redis-service.yaml` | Service (ClusterIP) | `redis` | Internal Redis endpoint for vote and worker |
+| `db-deployment.yaml` | Deployment | `db` | Runs Postgres 15 for vote storage (port 5432) |
+| `db-service.yaml` | Service (ClusterIP) | `db` | Internal Postgres endpoint for worker and result |
+
+## Example manifests
+
+The vote Deployment and Service are shown below as a representative example.
+
+<CodeGroup>
+```yaml vote-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: vote
+  name: vote
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vote
+  template:
+    metadata:
+      labels:
+        app: vote
+    spec:
+      containers:
+      - image: dockersamples/examplevotingapp_vote
+        name: vote
+        ports:
+        - containerPort: 80
+          name: vote
+```
+
+```yaml vote-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: vote
+  name: vote
+spec:
+  type: NodePort
+  ports:
+  - name: "vote-service"
+    port: 8080
+    targetPort: 80
+    nodePort: 31000
+  selector:
+    app: vote
+```
+</CodeGroup>
+
+## All deployment and service pairs
+
+<CodeGroup>
+```yaml result-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: result
+  name: result
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: result
+  template:
+    metadata:
+      labels:
+        app: result
+    spec:
+      containers:
+      - image: dockersamples/examplevotingapp_result
+        name: result
+        ports:
+        - containerPort: 80
+          name: result
+```
+
+```yaml result-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: result
+  name: result
+spec:
+  type: NodePort
+  ports:
+  - name: "result-service"
+    port: 8081
+    targetPort: 80
+    nodePort: 31001
+  selector:
+    app: result
+```
+
+```yaml worker-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: worker
+  name: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+      - image: dockersamples/examplevotingapp_worker
+        name: worker
+```
+
+```yaml redis-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: redis
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - image: redis:alpine
+        name: redis
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - mountPath: /data
+          name: redis-data
+      volumes:
+      - name: redis-data
+        emptyDir: {} 
+```
+
+```yaml redis-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: redis
+  name: redis
+spec:
+  type: ClusterIP
+  ports:
+  - name: "redis-service"
+    port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+```
+
+```yaml db-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: db
+  name: db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - image: postgres:15-alpine
+        name: postgres
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: db-data
+      volumes:
+      - name: db-data
+        emptyDir: {} 
+```
+
+```yaml db-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: db
+  name: db
+spec:
+  type: ClusterIP
+  ports:
+  - name: "db-service"
+    port: 5432
+    targetPort: 5432
+  selector:
+    app: db
+```
+</CodeGroup>
+
+<Warning>
+  Both the Redis and Postgres Deployments use `emptyDir` volumes. Data does **not** persist across pod restarts. For persistent storage, replace `emptyDir: {}` with a `PersistentVolumeClaim`.
+</Warning>
+
+## Removing the app
+
+To delete all resources created by the specifications:
+
+```bash
+kubectl delete -f k8s-specifications/
+```
+
+This removes all five Deployments and their associated Services from the current namespace.

@@ -1,0 +1,235 @@
+---
+title: Docker Compose
+description: Run the Example Voting App locally using Docker Compose for development.
+---
+
+Docker Compose is the recommended way to run the app locally. It builds all images from source, mounts local directories for hot reloading, and uses health checks to sequence service startup correctly.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="Docker Desktop" icon="docker">
+    Includes Docker Engine and the Compose plugin. Available for Mac and Windows.
+  </Card>
+  <Card title="Docker Engine + Compose plugin" icon="server">
+    For Linux, install Docker Engine and then add the Compose plugin separately.
+  </Card>
+</CardGroup>
+
+Verify your installation:
+
+```bash
+docker compose version
+```
+
+## Running the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Start all services">
+    From the repository root, run:
+
+    ```bash
+    docker compose up
+    ```
+
+    Compose builds the `vote`, `result`, and `worker` images from source, then pulls `redis:alpine` and `postgres:15-alpine`. Services start in dependency order — Redis and Postgres come up first, and their health checks must pass before the dependent services are launched.
+  </Step>
+
+  <Step title="Open the app">
+    | Interface | URL |
+    |-----------|-----|
+    | Voting    | http://localhost:8080 |
+    | Results   | http://localhost:8081 |
+  </Step>
+</Steps>
+
+## Service configuration
+
+The full `docker-compose.yml` services section:
+
+```yaml
+services:
+  vote:
+    build: 
+      context: ./vote
+      target: dev
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+     - ./vote:/usr/local/app
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier
+      - back-tier
+
+  result:
+    build: ./result
+    # use nodemon rather than node for local dev
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    depends_on:
+      db:
+        condition: service_healthy 
+    volumes:
+      - ./result:/usr/local/app
+    ports:
+      - "8081:80"
+      - "127.0.0.1:9229:9229"
+    networks:
+      - front-tier
+      - back-tier
+
+  worker:
+    build:
+      context: ./worker
+    depends_on:
+      redis:
+        condition: service_healthy 
+      db:
+        condition: service_healthy 
+    networks:
+      - back-tier
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - "./healthchecks:/healthchecks"
+    healthcheck:
+      test: /healthchecks/redis.sh
+      interval: "5s"
+    networks:
+      - back-tier
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    volumes:
+      - "db-data:/var/lib/postgresql/data"
+      - "./healthchecks:/healthchecks"
+    healthcheck:
+      test: /healthchecks/postgres.sh
+      interval: "5s"
+    networks:
+      - back-tier
+
+  # this service runs once to seed the database with votes
+  # it won't run unless you specify the "seed" profile
+  # docker compose --profile seed up -d
+  seed:
+    build: ./seed-data
+    profiles: ["seed"]
+    depends_on:
+      vote:
+        condition: service_healthy 
+    networks:
+      - front-tier
+    restart: "no"
+
+volumes:
+  db-data:
+
+networks:
+  front-tier:
+  back-tier:
+```
+
+## Health checks
+
+Redis and Postgres use custom shell scripts mounted from `./healthchecks/`. This ensures that dependent services only start once the backing stores are fully ready to accept connections — not just running.
+
+<CodeGroup>
+```bash healthchecks/redis.sh
+#!/bin/sh
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+
+if ping="$(redis-cli -h "$host" ping)" && [ "$ping" = 'PONG' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+```bash healthchecks/postgres.sh
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+	# force postgres to not use the local unix socket (test "external" connectibility)
+	--host "$host"
+	--username "$user"
+	--dbname "$db"
+	--quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+	exit 0
+fi
+
+exit 1
+```
+</CodeGroup>
+
+## Development mode
+
+The Compose file is configured for active development:
+
+- **Vote service** mounts `./vote` into the container at `/usr/local/app`. Changes to Python source files are reflected immediately without rebuilding.
+- **Result service** runs via `nodemon`, which watches for file changes and restarts the Node.js process automatically. The local `./result` directory is also volume-mounted.
+- **Node.js inspector** is available on `127.0.0.1:9229` for the result service, allowing you to attach a debugger.
+
+<Note>
+  The debug port `9229` is bound to `127.0.0.1` only, so it is not exposed on your network — only reachable from localhost.
+</Note>
+
+## Seeding test data
+
+A `seed` service is included in the Compose file but is gated behind a [Compose profile](https://docs.docker.com/compose/profiles/). It does not run with a plain `docker compose up`.
+
+To seed the database with sample votes:
+
+```bash
+docker compose --profile seed up -d
+```
+
+The seed service submits votes against the vote service's HTTP endpoint. It runs once and exits (`restart: "no"`). It waits for the `vote` service to pass its health check before running.
+
+## Stopping the app
+
+Stop all running containers:
+
+```bash
+docker compose down
+```
+
+To also remove the named `db-data` volume (this deletes all stored votes):
+
+```bash
+docker compose down -v
+```
+
+<Warning>
+  Using `-v` permanently deletes the Postgres data volume. All stored votes will be lost.
+</Warning>

@@ -1,0 +1,185 @@
+---
+title: Scaling
+description: How to scale the Example Voting App with Docker Compose, Docker Swarm, and Kubernetes — and what the limits are for this demo application.
+---
+
+<Warning>
+  The Example Voting App is a demo application. Redis and PostgreSQL each run as a single instance with no replication, clustering, or high-availability configuration. Scaling the application tier provides more capacity for incoming requests, but the data tier remains a single point of failure. Do not run this setup in production without replacing these components with HA-capable alternatives.
+</Warning>
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Docker Compose is intended for local development. Each service runs as a single container, and the `docker-compose.yml` file does not define a `deploy` section.
+
+    ```yaml
+    services:
+      vote:
+        build:
+          context: ./vote
+          target: dev
+        ports:
+          - "8080:80"
+
+      result:
+        build: ./result
+        ports:
+          - "8081:80"
+
+      worker:
+        build:
+          context: ./worker
+    ```
+
+    Attempting to run multiple replicas of `vote` or `result` in Compose would cause a port conflict because both bind to fixed host ports (`8080` and `8081`). Compose is not the right tool for scaling — use Swarm or Kubernetes for that.
+
+    <Note>
+      The `deploy` key in `docker-compose.yml` is ignored by `docker compose` and only takes effect when deploying to a Swarm cluster.
+    </Note>
+  </Tab>
+
+  <Tab title="Docker Swarm">
+    The `docker-stack.yml` file is purpose-built for Swarm. It uses pre-built images from Docker Hub and sets replica counts under the `deploy` key.
+
+    ```yaml
+    services:
+      vote:
+        image: dockersamples/examplevotingapp_vote
+        ports:
+          - 8080:80
+        deploy:
+          replicas: 2
+
+      worker:
+        image: dockersamples/examplevotingapp_worker
+        deploy:
+          replicas: 2
+
+      result:
+        image: dockersamples/examplevotingapp_result
+        ports:
+          - 8081:80
+    ```
+
+    **Why vote and worker scale safely**
+
+    Both services are stateless:
+    - `vote` accepts an HTTP POST and writes a JSON blob to a Redis list. Any replica can handle any request — there is no session state on the container itself.
+    - `worker` pops items off the Redis list and writes them to PostgreSQL. Multiple worker replicas can run concurrently because each item is atomically removed from the list by a single worker.
+
+    Swarm's routing mesh distributes incoming requests across all `vote` replicas automatically, so no changes to client configuration are needed.
+
+    **Scaling commands**
+
+    Deploy the stack first:
+
+    ```bash
+    docker stack deploy --compose-file docker-stack.yml vote
+    ```
+
+    Then scale any service at runtime:
+
+    ```bash
+    # Scale vote to 3 replicas
+    docker service scale vote_vote=3
+
+    # Scale worker to 4 replicas
+    docker service scale vote_worker=4
+    ```
+
+    Check replica status:
+
+    ```bash
+    docker service ls
+    ```
+
+    **Why result should not be scaled without a load balancer**
+
+    The result service uses Socket.IO to push live vote counts to the browser. Socket.IO maintains a persistent WebSocket connection (or falls back to long-polling) between the browser and a specific server instance. If traffic is split across multiple `result` replicas without sticky sessions on the load balancer, a browser may connect to a replica that does not have its existing Socket.IO session, causing the live update stream to break.
+
+    Swarm's routing mesh does not provide sticky sessions. To safely scale `result`, place a load balancer in front that supports session affinity.
+  </Tab>
+
+  <Tab title="Kubernetes">
+    The Kubernetes manifests in `k8s-specifications/` start each deployment with a single replica.
+
+    ```yaml
+    # vote-deployment.yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: vote
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: vote
+      template:
+        metadata:
+          labels:
+            app: vote
+        spec:
+          containers:
+          - image: dockersamples/examplevotingapp_vote
+            name: vote
+            ports:
+            - containerPort: 80
+              name: vote
+    ```
+
+    ```yaml
+    # worker-deployment.yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: worker
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: worker
+      template:
+        metadata:
+          labels:
+            app: worker
+        spec:
+          containers:
+          - image: dockersamples/examplevotingapp_worker
+            name: worker
+    ```
+
+    **Scaling with kubectl**
+
+    ```bash
+    # Scale the vote deployment to 3 replicas
+    kubectl scale deployment vote --replicas=3
+
+    # Scale the worker deployment to 2 replicas
+    kubectl scale deployment worker --replicas=2
+
+    # Check rollout status
+    kubectl rollout status deployment/vote
+    ```
+
+    **Horizontal Pod Autoscaler**
+
+    The manifests do not include an HPA, but one can be added to automatically scale `vote` or `worker` based on CPU utilization:
+
+    ```bash
+    kubectl autoscale deployment vote --cpu-percent=50 --min=1 --max=10
+    ```
+
+    This requires the Kubernetes Metrics Server to be installed in the cluster.
+
+    The same Socket.IO caveat applies on Kubernetes: scaling `result` beyond one replica requires a load balancer with sticky sessions (e.g., configure `sessionAffinity: ClientIP` on the result Service, or use an Ingress controller that supports cookie-based affinity).
+  </Tab>
+</Tabs>
+
+## Scaling Limitations Summary
+
+| Component | Scalable? | Reason |
+|---|---|---|
+| `vote` | Yes | Stateless HTTP handler; Redis distributes the queue |
+| `worker` | Yes | Stateless queue consumer; Redis list provides atomic pop |
+| `result` | With caveats | Socket.IO requires sticky sessions on the load balancer |
+| `redis` | No (demo) | Single instance; no Redis Cluster or Sentinel configured |
+| `db` (PostgreSQL) | No (demo) | Single instance; no replication or connection pooling |

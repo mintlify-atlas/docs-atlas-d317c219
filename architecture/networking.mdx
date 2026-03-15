@@ -1,0 +1,242 @@
+---
+title: Networking
+description: Network topology for the Example Voting App across Docker Compose, Docker Swarm, and Kubernetes — tiers, port mappings, and service discovery.
+---
+
+The app's networking is designed to limit which services can talk to which. User-facing services are reachable from the host; internal services are not.
+
+<Tabs>
+  <Tab title="Docker Compose">
+
+    ## Network tiers
+
+    Compose creates two user-defined bridge networks:
+
+    ```yaml
+    networks:
+      front-tier:
+      back-tier:
+    ```
+
+    Services are assigned to networks as follows:
+
+    | Service | front-tier | back-tier |
+    |---------|:-----------:|:---------:|
+    | vote | ✓ | ✓ |
+    | result | ✓ | ✓ |
+    | worker | | ✓ |
+    | redis | | ✓ |
+    | db | | ✓ |
+
+    **front-tier** connects the two browser-facing services (`vote` and `result`). No infrastructure service is reachable from this network.
+
+    **back-tier** connects all five services. This is where `vote` reaches Redis, where `worker` reaches both Redis and PostgreSQL, and where `result` reaches PostgreSQL.
+
+    ### Why worker is on both networks
+
+    The worker has no browser-facing role and exposes no port, so it does not strictly need `front-tier`. In the Compose file the worker is on `back-tier` only:
+
+    ```yaml
+    worker:
+      networks:
+        - back-tier
+    ```
+
+    It reaches Redis and PostgreSQL purely through `back-tier` using their service-name hostnames.
+
+    <Note>
+      In the Docker Swarm stack (`docker-stack.yml`) the network names change to `frontend` and `backend`, and the worker is explicitly placed on **both** — see the Swarm tab for details.
+    </Note>
+
+    ## Port mappings
+
+    Only `vote` and `result` publish ports to the host:
+
+    | Service | Host port | Container port | Purpose |
+    |---------|-----------|----------------|---------|
+    | vote | 8080 | 80 | Ballot UI |
+    | result | 8081 | 80 | Results UI |
+    | result | 127.0.0.1:9229 | 9229 | Node.js inspector (local only) |
+
+    The `9229` debug port is bound to the loopback address only (`127.0.0.1:9229:9229`), so it is not accessible from other machines on the network.
+
+    Redis (6379) and PostgreSQL (5432) have no host port mappings — they are reachable only by other containers on `back-tier`.
+
+    ## Service discovery
+
+    Docker's embedded DNS resolves container hostnames within a user-defined network. Each service is reachable by its Compose service name:
+
+    | Hostname | Resolves to | Used by |
+    |----------|-------------|----------|
+    | `redis` | Redis container | vote (`Redis(host="redis")`) · worker (`OpenRedisConnection("redis")`) |
+    | `db` | PostgreSQL container | worker (`Server=db;...`) · result (`postgres://...@db/postgres`) |
+
+    No IP addresses or external DNS entries are needed.
+
+  </Tab>
+
+  <Tab title="Docker Swarm">
+
+    ## Overlay networks
+
+    The Swarm stack (`docker-stack.yml`) uses two overlay networks that span all nodes in the swarm:
+
+    ```yaml
+    networks:
+      frontend:
+      backend:
+    ```
+
+    Service placement mirrors the Compose tier design but with different names:
+
+    | Service | frontend | backend |
+    |---------|:--------:|:-------:|
+    | vote | ✓ | |
+    | result | | ✓ |
+    | worker | ✓ | ✓ |
+    | redis | ✓ | |
+    | db | | ✓ |
+
+    <Note>
+      In the Swarm stack, `result` is on `backend` (not `frontend`) and `redis` is on `frontend` — this differs from the Compose two-tier split. The worker bridges both overlays so it can reach Redis on `frontend` and PostgreSQL on `backend`.
+    </Note>
+
+    ## Port mappings
+
+    ```yaml
+    vote:
+      ports:
+        - 8080:80
+
+    result:
+      ports:
+        - 8081:80
+    ```
+
+    Swarm publishes these ports on every node via the routing mesh, so the UIs are reachable on port 8080 and 8081 regardless of which node the container is scheduled on.
+
+    ## Replicas
+
+    The Swarm stack scales `vote` and `worker` to two replicas each:
+
+    ```yaml
+    vote:
+      deploy:
+        replicas: 2
+
+    worker:
+      deploy:
+        replicas: 2
+    ```
+
+    Swarm's internal load balancer distributes traffic across replicas transparently.
+
+  </Tab>
+
+  <Tab title="Kubernetes">
+
+    ## Service types
+
+    Kubernetes services use two different types depending on whether the service needs to be externally accessible:
+
+    | Service | Type | Port | Target port | NodePort |
+    |---------|------|------|-------------|----------|
+    | vote | NodePort | 8080 | 80 | 31000 |
+    | result | NodePort | 8081 | 80 | 31001 |
+    | redis | ClusterIP | 6379 | 6379 | — |
+    | db | ClusterIP | 5432 | 5432 | — |
+
+    The `worker` has no Kubernetes Service at all — it is a consumer-only process.
+
+    ### vote service
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: vote
+    spec:
+      type: NodePort
+      ports:
+      - name: "vote-service"
+        port: 8080
+        targetPort: 80
+        nodePort: 31000
+      selector:
+        app: vote
+    ```
+
+    ### result service
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: result
+    spec:
+      type: NodePort
+      ports:
+      - name: "result-service"
+        port: 8081
+        targetPort: 80
+        nodePort: 31001
+      selector:
+        app: result
+    ```
+
+    ### redis service
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: redis
+    spec:
+      type: ClusterIP
+      ports:
+      - name: "redis-service"
+        port: 6379
+        targetPort: 6379
+      selector:
+        app: redis
+    ```
+
+    ### db service
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: db
+    spec:
+      type: ClusterIP
+      ports:
+      - name: "db-service"
+        port: 5432
+        targetPort: 5432
+      selector:
+        app: db
+    ```
+
+    ## Service discovery
+
+    Kubernetes DNS resolves Service names within the cluster exactly as Docker does with container hostnames. The application code requires no changes between runtimes:
+
+    | Hostname | Service type | Used by |
+    |----------|-------------|----------|
+    | `redis` | ClusterIP | vote · worker |
+    | `db` | ClusterIP | worker · result |
+
+    <Tip>
+      All resources are created in your current namespace (default: `default`). If you are using a different namespace, Service DNS names take the form `<service>.<namespace>.svc.cluster.local`, but the short names (`redis`, `db`) still work within the same namespace.
+    </Tip>
+
+    ## Accessing the app
+
+    After deploying with `kubectl create -f k8s-specifications/`, the UIs are available on every cluster node:
+
+    - Vote UI: `http://<node-ip>:31000`
+    - Results UI: `http://<node-ip>:31001`
+
+  </Tab>
+</Tabs>

@@ -1,0 +1,202 @@
+---
+title: Vote Service
+description: Python Flask front-end that presents the voting interface and queues votes in Redis.
+---
+
+The vote service is a Python [Flask](https://flask.palletsprojects.com/) web application that renders the voting form and records each choice into Redis for downstream processing.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="python">
+    Python 3.11 (Flask + Gunicorn)
+  </Card>
+  <Card title="Container port" icon="server">
+    80 (mapped to **8080** on the host)
+  </Card>
+  <Card title="Downstream dependency" icon="database">
+    Redis — hostname `redis`, port 6379
+  </Card>
+  <Card title="Networks" icon="network-wired">
+    `front-tier` and `back-tier`
+  </Card>
+</CardGroup>
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPTION_A` | `Cats` | Label for the first voting option |
+| `OPTION_B` | `Dogs` | Label for the second voting option |
+
+<Tip>
+Change `OPTION_A` and `OPTION_B` in `docker-compose.yml` to run the app with your own custom choices — no code change required.
+</Tip>
+
+## How it works
+
+The app exposes a single route that handles both `GET` and `POST` requests:
+
+- **GET /** — renders `templates/index.html` with the two voting options.
+- **POST /** — reads the submitted `vote` field, serialises a JSON payload, and pushes it to the Redis list `votes` with `RPUSH`.
+
+### Voter identity
+
+Each browser is assigned a persistent `voter_id` cookie the first time it visits. The ID is a random 64-bit value formatted as a hex string:
+
+```python
+voter_id = hex(random.getrandbits(64))[2:-1]
+```
+
+Because the PostgreSQL `votes` table uses `voter_id` as its primary key with a `UNIQUE` constraint, every subsequent vote from the same browser overwrites the previous one rather than adding a new row.
+
+### Redis connection
+
+The connection is created lazily on the first request and stored on Flask's `g` context object:
+
+```python
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+```
+
+- **Hostname:** `redis` (Docker service name)
+- **Port:** 6379 (default)
+- **Socket timeout:** 5 seconds
+
+### Vote payload
+
+Each item pushed to Redis is a JSON string with two fields:
+
+```json
+{"voter_id": "a3f2c1...", "vote": "a"}
+```
+
+The `vote` field is the raw form value — either `"a"` or `"b"` — which the worker service maps to the chosen option.
+
+## Full source — app.py
+
+```python
+from flask import Flask, render_template, request, make_response, g
+from redis import Redis
+import os
+import socket
+import random
+import json
+import logging
+
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+hostname = socket.gethostname()
+
+app = Flask(__name__)
+
+gunicorn_error_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers.extend(gunicorn_error_logger.handlers)
+app.logger.setLevel(logging.INFO)
+
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+
+@app.route("/", methods=['POST','GET'])
+def hello():
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=80, debug=True, threaded=True)
+```
+
+## Dockerfile
+
+The image uses a multi-stage build. The `dev` stage installs `watchdog` for file-system-based hot reload. The `final` stage runs Gunicorn with 4 workers.
+
+```dockerfile
+# base defines a base stage that uses the official python runtime base image
+FROM python:3.11-slim AS base
+
+# Add curl for healthcheck
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set the application directory
+WORKDIR /usr/local/app
+
+# Install our requirements.txt
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# dev defines a stage for development, where it'll watch for filesystem changes
+FROM base AS dev
+RUN pip install watchdog
+ENV FLASK_ENV=development
+CMD ["python", "app.py"]
+
+# final defines the stage that will bundle the application for production
+FROM base AS final
+
+# Copy our code from the current folder to the working directory inside the container
+COPY . .
+
+# Make port 80 available for links and/or publish
+EXPOSE 80
+
+# Define our command to be run when launching the container
+CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+```
+
+## Python dependencies
+
+```text
+Flask
+Redis
+gunicorn
+```
+
+## Docker Compose configuration
+
+<AccordionGroup>
+  <Accordion title="Ports and volumes">
+    - **Port mapping:** `8080:80` — the voting UI is available at `http://localhost:8080`.
+    - **Volume mount (dev):** `./vote:/usr/local/app` — local file changes are reflected inside the container immediately without rebuilding.
+  </Accordion>
+  <Accordion title="Health check">
+    ```yaml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ```
+    The `curl -f` flag causes a non-zero exit on HTTP error responses. The `seed` service will not start until this check passes.
+  </Accordion>
+  <Accordion title="Service dependencies">
+    The vote service declares `depends_on: redis: condition: service_healthy`, so Docker Compose will wait for Redis to pass its own health check before starting this container.
+  </Accordion>
+</AccordionGroup>

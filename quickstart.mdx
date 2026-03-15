@@ -1,80 +1,226 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Get the Example Voting App running in minutes using Docker Compose, Docker Swarm, or Kubernetes."
 ---
 
-## Get started in three steps
+Choose the deployment method that matches your environment. Docker Compose is the fastest path for local development. Docker Swarm and Kubernetes are available for cluster deployments.
 
-Get your documentation site running locally and make your first customization.
+<Tabs>
+  <Tab title="Docker Compose">
 
-### Step 1: Set up your local environment
+## Docker Compose (local development)
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Docker Compose builds the images from source and mounts local directories as volumes so code changes are reflected immediately without rebuilding.
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Build and start all services">
+    Run the following command from the project root:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    docker compose up
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Compose builds the `vote`, `result`, and `worker` images, pulls `redis:alpine` and `postgres:15-alpine`, and starts all five services. Health checks on Redis and PostgreSQL gate the dependent services so they start in the correct order.
+  </Step>
 
-### Step 3: Go live
+  <Step title="Open the app">
+    | Interface | URL |
+    |-----------|-----|
+    | Vote | [http://localhost:8080](http://localhost:8080) |
+    | Results | [http://localhost:8081](http://localhost:8081) |
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    Cast a vote in the vote interface and watch the results update in real time in the results interface.
+  </Step>
+</Steps>
 
-## Next steps
+### Customise the vote options
 
-Now that you have your docs running, explore these key features:
+By default the two options are **Cats** and **Dogs** (set in `vote/app.py`). Override them with environment variables before starting:
 
-<CardGroup cols={2}>
+```bash
+OPTION_A=Tabs OPTION_B=Spaces docker compose up
+```
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+Or add them to a `.env` file in the project root:
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+```bash
+OPTION_A=Tabs
+OPTION_B=Spaces
+```
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+### Seed the database with test votes
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+A dedicated `seed` service is included but disabled by default. Run it with the `seed` profile to populate the database with sample votes:
 
-</CardGroup>
+```bash
+docker compose --profile seed up -d
+```
+
+The seed service exits after it finishes — it has `restart: "no"` and depends on the `vote` service being healthy before it runs.
+
+### Stop and remove the app
+
+To stop all containers:
+
+```bash
+docker compose down
+```
+
+To also remove the named `db-data` volume (discards all stored votes):
+
+```bash
+docker compose down --volumes
+```
+
+<Tip>
+  The `result` service also exposes a Node.js debugger on `127.0.0.1:9229` when running under Compose, so you can attach a debugger from your editor.
+</Tip>
+
+  </Tab>
+
+  <Tab title="Docker Swarm">
+
+## Docker Swarm
+
+The `docker-stack.yml` file is configured specifically for Swarm. It uses pre-built images from Docker Hub and runs two replicas each of the `vote` and `worker` services.
+
+<Warning>
+  Do not use `docker-stack.yml` with `docker compose up`. Multiple replicas trying to bind to the same host port will fail outside of Swarm mode.
+</Warning>
+
+<Steps>
+  <Step title="Initialise a swarm">
+    If you do not already have a swarm, create one:
+
+    ```bash
+    docker swarm init
+    ```
+  </Step>
+
+  <Step title="Deploy the stack">
+    From the project root, deploy the stack using `docker-stack.yml`:
+
+    ```bash
+    docker stack deploy --compose-file docker-stack.yml vote
+    ```
+
+    This creates the stack named `vote` with all five services.
+  </Step>
+
+  <Step title="Check service status">
+    Verify all services are running:
+
+    ```bash
+    docker stack services vote
+    ```
+
+    Wait until all replicas report as running before opening the app.
+  </Step>
+
+  <Step title="Open the app">
+    | Interface | URL |
+    |-----------|-----|
+    | Vote | [http://localhost:8080](http://localhost:8080) |
+    | Results | [http://localhost:8081](http://localhost:8081) |
+  </Step>
+</Steps>
+
+### Service replicas
+
+The Swarm stack runs the following replicas:
+
+| Service | Replicas |
+|---------|----------|
+| `vote` | 2 |
+| `worker` | 2 |
+| `result` | 1 |
+| `redis` | 1 |
+| `db` | 1 |
+
+### Remove the stack
+
+```bash
+docker stack rm vote
+```
+
+To leave the swarm entirely:
+
+```bash
+docker swarm leave --force
+```
+
+  </Tab>
+
+  <Tab title="Kubernetes">
+
+## Kubernetes
+
+The `k8s-specifications/` directory contains Kubernetes Deployment and Service YAML manifests for all five services.
+
+<Steps>
+  <Step title="Ensure your cluster context is set">
+    Verify `kubectl` is pointing at the cluster you want to use:
+
+    ```bash
+    kubectl config current-context
+    ```
+  </Step>
+
+  <Step title="Create all deployments and services">
+    Apply all manifests in the `k8s-specifications/` directory:
+
+    ```bash
+    kubectl create -f k8s-specifications/
+    ```
+
+    Resources are created in the current namespace (`default` if you have not changed it).
+  </Step>
+
+  <Step title="Check pod status">
+    Wait for all pods to reach the `Running` state:
+
+    ```bash
+    kubectl get pods
+    ```
+  </Step>
+
+  <Step title="Open the app">
+    The services are exposed as NodePort services on each host in the cluster:
+
+    | Interface | Port |
+    |-----------|------|
+    | Vote | `31000` |
+    | Results | `31001` |
+
+    Access them at `http://<node-ip>:31000` and `http://<node-ip>:31001`.
+  </Step>
+</Steps>
+
+### Remove the app
+
+Delete all resources created from the manifests:
+
+```bash
+kubectl delete -f k8s-specifications/
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Kubernetes deployments use NodePort services on ports 31000 and 31001, which differ from the 8080/8081 ports used in Compose and Swarm deployments.
 </Note>
+
+  </Tab>
+</Tabs>
+
+## Port reference
+
+| Service | Compose / Swarm port | Kubernetes NodePort |
+|---------|---------------------|--------------------|
+| `vote` | `8080` | `31000` |
+| `result` | `8081` | `31001` |
